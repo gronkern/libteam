@@ -7,6 +7,11 @@ Makefile.in
 *.lo
 *.pc
 
+.cproject
+.project
+.autotools
+.settings
+
 /autom4te.cache/
 /build-aux/
 /aclocal.m4
