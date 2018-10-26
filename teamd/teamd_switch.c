@@ -18,8 +18,14 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include <errno.h>
+#include <sys/types.h>
+#include <unistd.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <private/list.h>
 #include <private/misc.h>
 #include <team.h>
@@ -27,24 +33,26 @@
 #include "teamd.h"
 #include "teamd_config.h"
 
-struct tb_stats {
+#define HASH_COUNT 256
+
+struct ts_stats {
 	uint64_t last_bytes;
 	uint64_t curr_bytes;
 	bool initialized;
 };
 
-struct tb_hash_info {
+struct ts_hash_info {
 	uint8_t hash;
-	struct tb_stats stats;
+	struct ts_stats stats;
 	struct teamd_port *tdport;
 	struct {
 		bool processed;
 	} rebalance;
 };
 
-struct tb_port_info {
+struct ts_port_info {
 	struct list_item list;
-	struct tb_stats stats;
+	struct ts_stats stats;
 	struct teamd_port *tdport;
 	struct {
 		uint64_t bytes;
@@ -52,203 +60,36 @@ struct tb_port_info {
 	} rebalance;
 };
 
-#define HASH_COUNT 256
+typedef enum teamd_switch_algorithm_type {
+	TEAM_SWITCH_OPTION_BASIC,
+	TEAM_SWITCH_OPTION_CUSTOM,
+} teamd_switch_algorithm_t;
 
-typedef enum teamd_balancing_algorithm_type {
-	TEAM_BALANCING_OPTION_BASIC,
-	TEAM_BALANCING_OPTION_CUSTOM,
-} teamd_balancing_algorithm_t;
-
-struct teamd_balancer {
-	struct teamd_context *ctx;
-	teamd_balancing_algorithm_t tx_balancing_enabled;
-	uint32_t balancing_interval;
-	struct tb_hash_info hash_info[HASH_COUNT];
-	struct list_item port_info_list;
+struct teamd_bpf_code {
+	ssize_t length;
+	u_char *code;
 };
 
-static struct tb_port_info *get_tb_port_info(struct teamd_balancer *tb,
-					     struct teamd_port *tdport)
-{
-	struct tb_port_info *tbpi;
+struct teamd_switcher {
+	struct teamd_context *ctx;
+	struct ts_hash_info hash_info[HASH_COUNT];
+	struct list_item port_info_list;
+	teamd_switch_algorithm_t tx_balancing_enabled;
+	struct teamd_bpf_code bpf_code;
+};
 
-	list_for_each_node_entry(tbpi, &tb->port_info_list, list) {
-		if (tbpi->tdport == tdport)
-			return tbpi;
-	}
-	return NULL;
-}
-
-static uint64_t tb_stats_get_delta(struct tb_stats *stats)
-{
-	return stats->curr_bytes - stats->last_bytes;
-}
-
-static void tb_stats_update_last(struct tb_stats *stats)
-{
-	stats->last_bytes = stats->curr_bytes;
-}
-
-static void tb_stats_update(struct tb_stats *stats,
-			    uint64_t bytes)
-{
-	stats->curr_bytes = bytes;
-	if (!stats->initialized) {
-		tb_stats_update_last(stats);
-		stats->initialized = true;
-	}
-}
-
-static void tb_stats_all_update_last(struct teamd_balancer *tb)
-{
-	struct tb_port_info *tbpi;
-	int i;
-
-	list_for_each_node_entry(tbpi, &tb->port_info_list, list)
-		tb_stats_update_last(&tbpi->stats);
-	for (i = 0; i < HASH_COUNT; i++)
-		tb_stats_update_last(&tb->hash_info[i].stats);
-}
-
-static void tb_stats_update_hash(struct teamd_balancer *tb,
-				 uint8_t hash, uint64_t bytes)
-{
-	tb_stats_update(&tb->hash_info[hash].stats, bytes);
-}
-
-static void tb_stats_update_port(struct teamd_balancer *tb,
-				 struct teamd_port *tdport, uint64_t bytes)
-{
-	struct tb_port_info *tbpi;
-
-	tbpi = get_tb_port_info(tb, tdport);
-	if (tbpi)
-		tb_stats_update(&tbpi->stats, bytes);
-}
-
-static void tb_hash_to_port_map_update(struct teamd_balancer *tb,
+static void ts_hash_to_port_map_update(struct teamd_switcher *ts,
 				       uint8_t hash, struct teamd_port *tdport)
 {
-	tb->hash_info[hash].tdport = tdport;
+	ts->hash_info[hash].tdport = tdport;
 }
 
-static struct tb_port_info *tb_get_least_loaded_port(struct teamd_balancer *tb)
-{
-	struct tb_port_info *tbpi;
-	struct tb_port_info *best_tbpi = NULL;
-
-	list_for_each_node_entry(tbpi, &tb->port_info_list, list) {
-		if (tbpi->rebalance.unusable)
-			continue;
-		if (!best_tbpi ||
-		    tbpi->rebalance.bytes < best_tbpi->rebalance.bytes)
-			best_tbpi = tbpi;
-	}
-	return best_tbpi;
-}
-
-static struct tb_hash_info *tb_get_biggest_unprocessed_hash(struct teamd_balancer *tb)
-{
-	struct tb_hash_info *tbhi;
-	struct tb_hash_info *best_tbhi = NULL;
-	int i;
-
-	for (i = 0; i < HASH_COUNT; i++) {
-		tbhi = &tb->hash_info[i];
-		if (tbhi->rebalance.processed)
-			continue;
-		if (!best_tbhi || tb_stats_get_delta(&tbhi->stats) >
-				  tb_stats_get_delta(&best_tbhi->stats))
-			best_tbhi = tbhi;
-	}
-	return best_tbhi;
-}
-
-static void tb_clear_rebalance_data(struct teamd_balancer *tb)
-{
-	struct tb_port_info *tbpi;
-	int i;
-
-	list_for_each_node_entry(tbpi, &tb->port_info_list, list) {
-		tbpi->rebalance.bytes = 0;
-		tbpi->rebalance.unusable = false;
-	}
-	for (i = 0; i < HASH_COUNT; i++) {
-		tb->hash_info[i].rebalance.processed = false;
-	}
-}
-
-static int tb_hash_to_port_remap(struct team_handle *th,
-				 struct tb_hash_info *tbhi,
-				 struct tb_port_info *tbpi)
-{
-	struct team_option *option;
-	struct teamd_port *new_tdport = tbpi->tdport;
-	uint8_t hash = tbhi->hash;
-	int err;
-
-	if (tbhi->tdport == new_tdport)
-		return 0;
-
-	option = team_get_option(th, "na", "lb_tx_hash_to_port_mapping", hash);
-	if (!option)
-		return -ENOENT;
-	err = team_set_option_value_u32(th, option, new_tdport->ifindex);
-	if (err)
-		return err;
-	teamd_log_dbg("Remapped hash \"%u\" (delta %" PRIu64 ") to port %s.",
-		      hash, tb_stats_get_delta(&tbhi->stats),
-		      new_tdport->ifname);
-	return 0;
-}
-
-static int tb_rebalance(struct teamd_balancer *tb, struct team_handle *th)
-{
-	int err;
-	struct tb_hash_info *tbhi;
-	struct tb_port_info *tbpi;
-
-	if (!tb->tx_balancing_enabled)
-		return 0;
-
-	tb_clear_rebalance_data(tb);
-
-	while ((tbhi = tb_get_biggest_unprocessed_hash(tb)) &&
-	       (tbpi = tb_get_least_loaded_port(tb))) {
-		/* Do not remap zero delta hashes */
-		if (tbhi->tdport && !tb_stats_get_delta(&tbhi->stats)) {
-			tbhi->rebalance.processed = true;
-			continue;
-		}
-		err = tb_hash_to_port_remap(th, tbhi, tbpi);
-		if (err) {
-			tbpi->rebalance.unusable = true;
-			continue;
-		}
-		tbpi->rebalance.bytes += tb_stats_get_delta(&tbhi->stats);
-		tbhi->rebalance.processed = true;
-	}
-
-	list_for_each_node_entry(tbpi, &tb->port_info_list, list) {
-		if (tbpi->rebalance.unusable)
-			continue;
-		teamd_log_dbg("Port %s rebalanced, delta: %" PRIu64,
-			      tbpi->tdport->ifname, tbpi->rebalance.bytes);
-	}
-	return 0;
-}
-
-struct lb_stats {
-	uint64_t tx_bytes;
-};
-
-static int tb_option_change_handler_func(struct team_handle *th, void *priv,
+static int ts_option_change_handler_func(struct team_handle *th, void *priv,
 					 team_change_type_mask_t type_mask)
 {
-	struct teamd_balancer *tb = priv;
-	struct teamd_context *ctx = tb->ctx;
+	struct teamd_switcher *ts = priv;
+	struct teamd_context *ctx = ts->ctx;
 	struct team_option *option;
-	bool rebalance_needed = false;
 
 	team_for_each_option(option, ctx->th) {
 		char *name = team_get_option_name(option);
@@ -271,69 +112,17 @@ static int tb_option_change_handler_func(struct team_handle *th, void *priv,
 			}
 			port_ifindex = team_get_option_value_u32(option);
 			tdport = teamd_get_port(ctx, port_ifindex);
-			tb_hash_to_port_map_update(tb, array_index, tdport);
+			ts_hash_to_port_map_update(ts, array_index, tdport);
 
 		}
 		if (!changed)
 			continue;
-		if (!strcmp(name, "lb_hash_stats") ||
-		    !strcmp(name, "lb_port_stats") ||
-		    !strcmp(name, "enabled"))
-			rebalance_needed = true;
 	}
 
-	if (!rebalance_needed)
-		return 0;
-
-	tb_stats_all_update_last(tb);
-
-	team_for_each_option(option, ctx->th) {
-		char *name = team_get_option_name(option);
-		bool changed = team_is_option_changed(option);
-		struct lb_stats *lb_stats;
-
-		if (!changed)
-			continue;
-		if (team_get_option_type(option) != TEAM_OPTION_TYPE_BINARY)
-			continue;
-
-		lb_stats = team_get_option_value_binary(option);
-		if (!strcmp(name, "lb_hash_stats")) {
-			uint32_t array_index;
-
-			array_index = team_get_option_array_index(option);
-			if (array_index >= HASH_COUNT) {
-				teamd_log_err("Wrong array index \"%u\" for option lb_hash_stats.",
-					      array_index);
-				return -EINVAL;
-			}
-			teamd_log_dbg("stats update for hash \"%u\": \"%" PRIu64 "\".",
-				      array_index, lb_stats->tx_bytes);
-			tb_stats_update_hash(tb, array_index,
-					     lb_stats->tx_bytes);
-		}
-		else if (!strcmp(name, "lb_port_stats")) {
-			struct teamd_port *tdport;
-			uint32_t port_ifindex;
-
-			port_ifindex = team_get_option_port_ifindex(option);
-			tdport = teamd_get_port(ctx, port_ifindex);
-			if (!tdport) {
-				teamd_log_err("Port with interface index \"%u\" is not part of this device.",
-					      port_ifindex);
-				return -EINVAL;
-			}
-			teamd_log_dbg("stats update for port %s: \"%" PRIu64 "\".",
-				      tdport->ifname, lb_stats->tx_bytes);
-			tb_stats_update_port(tb, tdport,
-					     lb_stats->tx_bytes);
-		}
-	}
-
-	return tb_rebalance(tb, th);
+	return 0;
 }
 
-static teamd_balancing_algorithm_t tb_get_enable_tx_balancing(struct teamd_context *ctx)
+static teamd_switch_algorithm_t ts_get_enable_tx_balancing(struct teamd_context *ctx)
 {
 	int err;
 	const char *tx_balancer_name;
@@ -342,26 +131,20 @@ static teamd_balancing_algorithm_t tb_get_enable_tx_balancing(struct teamd_conte
 	if (err)
 		return false; /* disabled by default */
 	if (!strcmp(tx_balancer_name, "basic")) {
-		return TEAM_BALANCING_OPTION_BASIC;
+		return TEAM_SWITCH_OPTION_BASIC;
 	} else if (!strcmp(tx_balancer_name, "custom")) {
-		return TEAM_BALANCING_OPTION_CUSTOM;
+		return TEAM_SWITCH_OPTION_CUSTOM;
 	}
 	return false;
 }
 
-static uint32_t tb_get_balancing_interval(struct teamd_context *ctx)
-{
-	int err;
-	int balancing_interval;
+static const struct team_change_handler ts_option_change_handler = {
+	.func = ts_option_change_handler_func,
+	.type_mask = TEAM_OPTION_CHANGE,
+};
 
-	err = teamd_config_int_get(ctx, &balancing_interval, "$.runner.tx_balancer.balancing_interval");
-	if (err || balancing_interval < 0)
-		return 50; /* 5sec is default */
-	return balancing_interval;
-}
-
-static int tb_set_lb_tx_method(struct team_handle *th,
-			       struct teamd_balancer *tb)
+static int ts_set_lb_tx_method(struct team_handle *th,
+			       struct teamd_switcher *ts)
 {
 	struct team_option *option;
 
@@ -369,108 +152,193 @@ static int tb_set_lb_tx_method(struct team_handle *th,
 	if (!option)
 		return -ENOENT;
 	return team_set_option_value_string(th, option,
-					    tb->tx_balancing_enabled ?
+					    ts->tx_balancing_enabled ?
 					    "hash_to_port_mapping" : "hash");
 }
 
-static int tb_set_lb_stats_refresh_interval(struct team_handle *th,
-					    struct teamd_balancer *tb)
+int teamd_switch_init(struct teamd_context *ctx, struct teamd_switcher **ptb)
 {
-	struct team_option *option;
-
-	option = team_get_option(th, "n!", "lb_stats_refresh_interval");
-	if (!option)
-		return -ENOENT;
-	return team_set_option_value_u32(th, option, tb->balancing_interval);
-}
-
-static const struct team_change_handler tb_option_change_handler = {
-	.func = tb_option_change_handler_func,
-	.type_mask = TEAM_OPTION_CHANGE,
-};
-
-int teamd_balancer_init(struct teamd_context *ctx, struct teamd_balancer **ptb)
-{
-	struct teamd_balancer *tb;
+	struct teamd_switcher *ts;
 	int err;
 	int i;
+	u_char *bpf_code;
 
-	tb = myzalloc(sizeof(*tb));
-	if (!tb)
+	ts = myzalloc(sizeof(*ts));
+	if (!ts)
 		return -ENOMEM;
 
-	list_init(&tb->port_info_list);
+	list_init(&ts->port_info_list);
 	for (i = 0; i < HASH_COUNT; i++)
-		tb->hash_info[i].hash = i;
+		ts->hash_info[i].hash = i;
 
-	tb->tx_balancing_enabled = tb_get_enable_tx_balancing(ctx);
-	tb->balancing_interval = tb_get_balancing_interval(ctx);
+	ts->tx_balancing_enabled = ts_get_enable_tx_balancing(ctx);
+	if(ts->tx_balancing_enabled != TEAM_SWITCH_OPTION_CUSTOM) {
+		teamd_log_err("Wrong option tx_balancing %li.", (long int) ts->tx_balancing_enabled);
+		err = -EINVAL;
+		goto err_read_config;
+		
+	} else if (ts->tx_balancing_enabled != TEAM_SWITCH_OPTION_CUSTOM) {
+		int bpf_file_fd;
+		const char *precompiled_bpf_filepath;
 
-	err = tb_set_lb_tx_method(ctx->th, tb);
+		err = teamd_config_string_get(ctx, &precompiled_bpf_filepath, "$.runner.tx_hash");
+		if (err) {
+			teamd_log_err("Error reading value of tx_hash.");
+			err = -EINVAL;
+			goto err_read_config;
+			
+		} else {
+			teamd_log_info("Reading precompiled bpf code at '%s'.", precompiled_bpf_filepath);
+			ssize_t read_size, bpf_code_size;
+			size_t realloc_count;
+			u_char buffer[16384] = {0u};
+			
+			bpf_file_fd = open(precompiled_bpf_filepath, O_RDONLY);
+			if(bpf_file_fd < 0) {
+				teamd_log_err("Error opening bpf code file: %i.", err);
+				goto err_read_bpf_code;
+				
+			} else {
+				bpf_code = (u_char *) myzalloc(sizeof(buffer));
+				if(NULL == bpf_code) {
+					err = -ENOMEM;
+					goto err_alloc_mem;
+				}
+
+				for(realloc_count = 0, bpf_code_size = 0; realloc_count < UINT_MAX; realloc_count++) {
+					read_size = read(bpf_file_fd, (void *) buffer, sizeof(buffer));
+					bpf_code_size += read_size;
+	
+					if(0 == read_size) {
+						break;
+						
+					} else if(read_size < 0) {
+						err = -1 * errno;
+						goto err_realloc_mem;
+						
+					} else if((read_size > 0) && (read_size < sizeof(buffer))) {
+						memcpy((void *) (bpf_code + (realloc_count * sizeof(buffer))), (void *) buffer, read_size);
+						break;
+						
+					} else if(read_size == sizeof(buffer)) {
+						u_char *bpf_code_tmp;
+						memcpy((void *) (bpf_code + (realloc_count * sizeof(buffer))), (void *) buffer, read_size);
+
+						bpf_code_tmp = (u_char *) reallocarray((void *) bpf_code, sizeof(buffer), realloc_count);
+						if(NULL == bpf_code_tmp) {
+							err = -ENOMEM;
+							goto err_realloc_mem;
+						}
+						bpf_code = bpf_code_tmp;
+						
+					} else {
+						teamd_log_err("Error reading value of bpf code %li.", read_size);
+						goto err_realloc_mem;
+					}
+				}
+
+				if(NULL != ts->bpf_code.code) {
+					free(ts->bpf_code.code);
+					ts->bpf_code.code = NULL;
+				}
+
+				ts->bpf_code.code = (u_char *) myzalloc(bpf_code_size);
+				if(NULL == ts->bpf_code.code) {
+					err = -ENOMEM;
+					goto err_realloc_mem;
+				}
+				ts->bpf_code.length = bpf_code_size;
+
+				memcpy((void *) (ts->bpf_code.code), (void *) bpf_code, bpf_code_size);
+				teamd_log_info("Read %li byte of bpf code from %s.", bpf_code_size, precompiled_bpf_filepath);
+			}
+		}
+	}
+
+	err = ts_set_lb_tx_method(ctx->th, ts);
 	if (err) {
 		teamd_log_err("Failed to set lb_tx_method.");
 		goto err_set_lb_tx_method;
 	}
 
-	teamd_log_info("TX balancing %s (%s).", tb->tx_balancing_enabled ?
-					   "enabled" : "disabled", tb->tx_balancing_enabled == TEAM_BALANCING_OPTION_BASIC ? "basic" : "custom" );
-	if (TEAM_BALANCING_OPTION_BASIC == tb->tx_balancing_enabled) {
-		err = tb_set_lb_stats_refresh_interval(ctx->th, tb);
-		if (err) {
-			teamd_log_err("Failed to set lb_stats_refresh_interval.");
-			goto err_set_lb_stats_refresh_interval;
-		}
-		teamd_log_info("Balancing interval %u.", tb->balancing_interval);
-	}
+	teamd_log_info("TX balancing %s (custom).", ts->tx_balancing_enabled ?
+					   "enabled" : "disabled");
 
-	tb->ctx = ctx;
+	ts->ctx = ctx;
 	err = team_change_handler_register(ctx->th,
-					   &tb_option_change_handler, tb);
+					   &ts_option_change_handler, ts);
 	if (err) {
-		teamd_log_err("Failed to register tb option change handler.");
+		teamd_log_err("Failed to register ts option change handler.");
 		goto err_change_handler_register;
 	}
-	*ptb = tb;
+	*ptb = ts;
 	return 0;
 
+err_realloc_mem:
+	free(bpf_code);
+	bpf_code = NULL;
+	
+err_alloc_mem:
+err_read_bpf_code:
+err_read_config:
 err_set_lb_tx_method:
-err_set_lb_stats_refresh_interval:
 err_change_handler_register:
-	free(tb);
+	free(ts);
 	return err;
 }
 
-void teamd_balancer_fini(struct teamd_balancer *tb)
+void teamd_switch_fini(struct teamd_switcher *ts)
 {
-	team_change_handler_unregister(tb->ctx->th,
-				       &tb_option_change_handler, tb);
-	free(tb);
+	team_change_handler_unregister(ts->ctx->th,
+				       &ts_option_change_handler, ts);
+	if(NULL != ts->bpf_code.code) {
+		free(ts->bpf_code.code);
+		ts->bpf_code.code = NULL;
+		ts->bpf_code.length = 0;
+	}
+
+	free(ts);
 }
 
-int teamd_balancer_port_added(struct teamd_balancer *tb,
+static struct ts_port_info *get_ts_port_info(struct teamd_switcher *ts,
+					     struct teamd_port *tdport)
+{
+	struct ts_port_info *tspi;
+
+	list_for_each_node_entry(tspi, &ts->port_info_list, list) {
+		if (tspi->tdport == tdport)
+			return tspi;
+	}
+	return NULL;
+}
+
+int teamd_switch_port_added(struct teamd_switcher *tb,
 			      struct teamd_port *tdport)
 {
-	struct tb_port_info *tbpi;
+	struct ts_port_info *tspi;
 
-	tbpi = get_tb_port_info(tb, tdport);
-	if (tbpi)
+	tspi = get_ts_port_info(tb, tdport);
+	if (tspi)
 		return -EEXIST;
-	tbpi = myzalloc(sizeof(*tbpi));
-	if (!tbpi)
+
+	tspi = myzalloc(sizeof(*tspi));
+	if (!tspi)
 		return -ENOMEM;
-	tbpi->tdport = tdport;
-	list_add(&tb->port_info_list, &tbpi->list);
+
+	tspi->tdport = tdport;
+
+	list_add(&tb->port_info_list, &tspi->list);
 	return 0;
 }
 
-void teamd_balancer_port_removed(struct teamd_balancer *tb,
+void teamd_switch_port_removed(struct teamd_switcher *ts,
 				 struct teamd_port *tdport)
 {
-	struct tb_port_info *tbpi;
+	struct ts_port_info *tspi;
 
-	tbpi = get_tb_port_info(tb, tdport);
-	if (!tbpi)
+	tspi = get_ts_port_info(ts, tdport);
+	if (!tspi)
 		return;
-	list_del(&tbpi->list);
-	free(tbpi);
+	list_del(&tspi->list);
+	free(tspi);
 }
